@@ -1,0 +1,23 @@
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+*.egg-info/
+.pytest_cache/
+*.db
+
+# Node
+node_modules/
+dist/
+.vite/
+
+# Environment - never commit real credentials
+.env
+.env.local
+*.env
+
+# Editors / OS
+.idea/
+.vscode/
+.DS_Store
