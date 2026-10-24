@@ -17,6 +17,17 @@ from app.services.verification_service import VerificationService
 router = APIRouter(prefix="/migrations", tags=["verification"])
 
 
+def _result_out(result, migration) -> VerificationResultOut:
+    payload = VerificationResultOut.model_validate(result)
+    payload.stale = result.is_stale_for(
+        migration.source_code,
+        migration.migrated_code,
+        migration.source_language,
+        migration.target_language,
+    )
+    return payload
+
+
 @router.post("/{migration_id}/validate")
 def validate_migrated_code(
     migration_id: int,
@@ -40,7 +51,7 @@ def validate_migrated_code(
                 "python": "python -m py_compile main.py",
                 "javascript": "node --check main.js",
             }[migration.target_language]
-            result = docker_executor._run_in_container(  # noqa: SLF001 - internal helper
+            result = docker_executor.run_shell(
                 image=program.language.image,
                 workdir=program.workdir,
                 shell_command=syntax_check,
@@ -71,7 +82,7 @@ def verify(
     return VerificationRunOut(
         migration_id=migration.id,
         migration_status=migration.status,
-        result=VerificationResultOut.model_validate(result),
+        result=_result_out(result, migration),
     )
 
 
@@ -89,14 +100,15 @@ def fix_with_ai(
         migration, max_attempts=payload.max_attempts
     )
     db.refresh(migration)
+    serialized = [_result_out(result, migration) for result in results]
     return FixRunOut(
         migration_id=migration.id,
         migration_status=migration.status,
         migrated_code=migration.migrated_code,
         attempts_used=len(corrections),
         corrections=corrections,
-        results=results,
-        final_result=results[-1] if results else None,
+        results=serialized,
+        final_result=serialized[-1] if serialized else None,
     )
 
 
@@ -108,6 +120,7 @@ def get_results(
 ) -> List[VerificationResultOut]:
     migration = MigrationService(db).get_for_user(user, migration_id)
     return [
-        VerificationResultOut.model_validate(result)
+        _result_out(result, migration)
         for result in sorted(migration.verification_results, key=lambda r: r.id)
     ]
+

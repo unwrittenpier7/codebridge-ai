@@ -8,18 +8,18 @@ from app.core.config import settings
 
 class MigrationCreate(BaseModel):
     title: str = Field(default="Untitled migration", max_length=200)
-    source_language: str
-    target_language: str
-    source_code: str = Field(default="")
-    project_id: Optional[int] = None
+    source_language: str = Field(min_length=1, max_length=32)
+    target_language: str = Field(min_length=1, max_length=32)
+    source_code: str = Field(default="", max_length=settings.max_code_size_bytes)
+    project_id: Optional[int] = Field(default=None, ge=1)
 
 
 class MigrationUpdate(BaseModel):
     title: Optional[str] = Field(default=None, max_length=200)
-    source_code: Optional[str] = None
-    migrated_code: Optional[str] = None
-    source_language: Optional[str] = None
-    target_language: Optional[str] = None
+    source_code: Optional[str] = Field(default=None, max_length=settings.max_code_size_bytes)
+    migrated_code: Optional[str] = Field(default=None, max_length=settings.max_code_size_bytes)
+    source_language: Optional[str] = Field(default=None, max_length=32)
+    target_language: Optional[str] = Field(default=None, max_length=32)
 
 
 class TestCaseOut(BaseModel):
@@ -32,6 +32,11 @@ class TestCaseOut(BaseModel):
     description: Optional[str]
     category: Optional[str]
     reference_status: Optional[str]
+    source_code_hash: Optional[str] = None
+    source_language: Optional[str] = None
+    #: True when these cases were generated from a different source version than
+    #: the one currently stored on the migration.
+    stale: bool = False
 
 
 class TestResultOut(BaseModel):
@@ -51,6 +56,8 @@ class TestResultOut(BaseModel):
     migrated_time_ms: Optional[float]
     status: str
     difference: Optional[str]
+    failure_reason: Optional[str] = None
+    reference_valid: bool = True
 
 
 class VerificationResultOut(BaseModel):
@@ -61,13 +68,22 @@ class VerificationResultOut(BaseModel):
     total_tests: int
     passed_tests: int
     failed_tests: int
+    error_tests: int = 0
     behavior_match_percentage: float
     compilation_status: str
     runtime_status: str
     overall_status: str
     compiler_error: Optional[str]
+    infrastructure_error: Optional[str] = None
     created_at: datetime
+    source_code_hash: Optional[str] = None
+    migrated_code_hash: Optional[str] = None
+    test_cases_hash: Optional[str] = None
+    source_language: Optional[str] = None
+    target_language: Optional[str] = None
     test_results: List[TestResultOut] = []
+    #: True when this run no longer describes the code stored on the migration.
+    stale: bool = False
 
 
 class CorrectionAttemptOut(BaseModel):
@@ -117,9 +133,9 @@ class MigrationDetail(BaseModel):
 
 
 class MigrateRequest(BaseModel):
-    source_code: Optional[str] = None
-    source_language: Optional[str] = None
-    target_language: Optional[str] = None
+    source_code: Optional[str] = Field(default=None, max_length=settings.max_code_size_bytes)
+    source_language: Optional[str] = Field(default=None, max_length=32)
+    target_language: Optional[str] = Field(default=None, max_length=32)
 
 
 class GenerateTestsRequest(BaseModel):
@@ -127,7 +143,7 @@ class GenerateTestsRequest(BaseModel):
 
 
 class VerifyRequest(BaseModel):
-    migrated_code: Optional[str] = None
+    migrated_code: Optional[str] = Field(default=None, max_length=settings.max_code_size_bytes)
 
 
 class FixRequest(BaseModel):

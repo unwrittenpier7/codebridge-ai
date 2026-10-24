@@ -82,3 +82,61 @@ def test_unconfigured_provider_raises_configuration_error(monkeypatch):
 def test_unknown_provider_is_rejected():
     with pytest.raises(ConfigurationError):
         get_provider("not-a-provider")
+
+
+# -- native JSON mode is used only for structured requests ----------------------
+class _FakeCompletions:
+    def __init__(self, recorder):
+        self._recorder = recorder
+
+    def create(self, **kwargs):
+        self._recorder.append(kwargs)
+
+        class _Message:
+            content = '[{"input": "1\\n", "description": "case"}]'
+            refusal = None
+
+        class _Choice:
+            message = _Message()
+            finish_reason = "stop"
+
+        class _Response:
+            choices = [_Choice()]
+
+        return _Response()
+
+
+class _FakeOpenAI:
+    def __init__(self, recorder):
+        self.chat = type("Chat", (), {"completions": _FakeCompletions(recorder)})()
+
+
+@pytest.fixture()
+def recording_openai(monkeypatch):
+    """Capture the kwargs the provider hands to the OpenAI SDK."""
+    recorder = []
+
+    def fake_client(self):
+        return _FakeOpenAI(recorder)
+
+    monkeypatch.setattr("app.core.config.settings.openai_api_key", "test-key", raising=False)
+    monkeypatch.setattr(OpenAIProvider, "_client", fake_client)
+    return recorder
+
+
+def test_complete_json_requests_openai_json_response_mode(recording_openai):
+    OpenAIProvider().complete_json("system", "user")
+    assert recording_openai[0]["response_format"] == {"type": "json_object"}
+
+
+def test_plain_complete_does_not_request_json_mode(recording_openai):
+    OpenAIProvider().complete("system", "user")
+    # Source-code generation must stay free-form: forcing JSON here degrades it.
+    assert "response_format" not in recording_openai[0]
+
+
+def test_generate_test_cases_uses_json_mode(recording_openai):
+    from app.services.ai_service import AIService
+
+    AIService(provider=OpenAIProvider()).generate_test_cases("print(1)\n", "python")
+    assert recording_openai[0]["response_format"] == {"type": "json_object"}

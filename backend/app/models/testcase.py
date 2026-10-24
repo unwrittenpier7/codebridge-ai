@@ -17,5 +17,9 @@ class TestCase(Base):
     description: Mapped[str | None] = mapped_column(String(500), nullable=True)
     category: Mapped[str | None] = mapped_column(String(64), nullable=True)
     reference_status: Mapped[str | None] = mapped_column(String(32), nullable=True)
+    #: Hash of the source program these reference outputs were produced from.
+    #: A mismatch means the cases no longer describe the current source code.
+    source_code_hash: Mapped[str | None] = mapped_column(String(64), nullable=True, index=True)
+    source_language: Mapped[str | None] = mapped_column(String(32), nullable=True)
 
     migration = relationship("Migration", back_populates="test_cases")

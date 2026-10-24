@@ -14,6 +14,25 @@ from app.database.connection import Base, get_db  # noqa: E402
 from app.main import app  # noqa: E402
 
 
+@pytest.fixture(autouse=True)
+def _isolate_rate_limiter(monkeypatch):
+    """Keep the in-process limiter from leaking state between tests.
+
+    The limiter instance is created once when the app is imported, so without
+    this every test in the session would share one counter and unrelated tests
+    would start receiving 429s. Rate limiting is off by default here; the tests
+    that exercise it turn it back on explicitly.
+    """
+    from app.core import rate_limit
+
+    monkeypatch.setattr(rate_limit.settings, "rate_limit_enabled", False, raising=False)
+    for name in ("_LIMITER", "_SENSITIVE_LIMITER", "_GENERAL_LIMITER"):
+        limiter = getattr(rate_limit, name, None)
+        if isinstance(limiter, rate_limit.SlidingWindowLimiter):
+            limiter.reset()
+    yield
+
+
 @pytest.fixture()
 def db_session():
     fd, path = tempfile.mkstemp(suffix=".db")
@@ -39,6 +58,19 @@ def client(db_session):
 
 
 @pytest.fixture()
+def raw_client(db_session):
+    """Like `client`, but surfaces the app's own 500 response instead of re-raising.
+
+    Needed to assert that an unexpected exception is converted into a safe error
+    body rather than leaking a traceback.
+    """
+    app.dependency_overrides[get_db] = lambda: db_session
+    with TestClient(app, raise_server_exceptions=False) as test_client:
+        yield test_client
+    app.dependency_overrides.clear()
+
+
+@pytest.fixture()
 def auth_headers(client):
     response = client.post(
         "/api/auth/register",
@@ -54,3 +86,19 @@ def docker_available():
 
     available, _ = docker_executor.availability()
     return available
+
+
+@pytest.fixture(autouse=True)
+def _skip_docker_tests_without_daemon(request):
+    """Skip @docker tests explicitly when no daemon is reachable.
+
+    They are never silently reported as passing: pytest records them as skipped
+    with the reason below, so a run without Docker is visibly incomplete.
+    """
+    if request.node.get_closest_marker("docker") is None:
+        return
+    from app.services.docker_executor import docker_executor
+
+    available, detail = docker_executor.availability()
+    if not available:
+        pytest.skip(f"Docker daemon unavailable: {detail}")

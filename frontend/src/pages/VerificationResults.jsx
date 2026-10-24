@@ -43,13 +43,19 @@ export default function VerificationResults() {
           .reverse()
           .map((result) => (
             <section key={result.id} className="space-y-3">
-              <h2 className="text-sm font-semibold text-slate-300">
+              <h2 className="flex flex-wrap items-center gap-2 text-sm font-semibold text-slate-300">
                 Run #{result.attempt_number + 1} · {new Date(result.created_at).toLocaleString()}
+                {result.stale ? (
+                  <span className="rounded border border-partial/40 bg-partial/10 px-2 py-0.5 text-xs font-normal text-partial">
+                    outdated: code has changed since this run
+                  </span>
+                ) : null}
               </h2>
               <VerificationSummary
                 result={result}
-                sourceLanguage={state.migration.source_language}
-                targetLanguage={state.migration.target_language}
+                sourceLanguage={result.source_language || state.migration.source_language}
+                targetLanguage={result.target_language || state.migration.target_language}
+                stale={Boolean(result.stale)}
               />
               <TestResultTable results={result.test_results} />
             </section>

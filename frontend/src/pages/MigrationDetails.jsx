@@ -31,6 +31,9 @@ export default function MigrationDetails() {
 
   const results = migration.verification_results || []
   const latest = results.length ? results[results.length - 1] : null
+  // The server decides staleness from the hashes it recorded at run time.
+  const latestStale = Boolean(latest?.stale)
+  const casesAreStale = (migration.test_cases || []).some((testCase) => testCase.stale)
 
   return (
     <div className="space-y-4">
@@ -91,18 +94,25 @@ export default function MigrationDetails() {
 
       {tab === 'Test cases' ? (
         <div className="card">
-          <TestCaseList testCases={migration.test_cases} />
+          <TestCaseList testCases={migration.test_cases} stale={casesAreStale} />
         </div>
       ) : null}
 
       {tab === 'Verification' ? (
         latest ? (
           <div className="space-y-4">
+            {latestStale ? (
+              <Alert variant="warning" title="This result is out of date">
+                The migration code has changed since this run. Re-run verification in the workspace
+                before trusting these numbers.
+              </Alert>
+            ) : null}
             <VerificationSummary
               result={latest}
               sourceLanguage={migration.source_language}
               targetLanguage={migration.target_language}
               migrationStatus={migration.status}
+              stale={latestStale}
             />
             <TestResultTable results={latest.test_results} />
           </div>

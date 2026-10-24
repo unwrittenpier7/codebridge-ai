@@ -1,6 +1,6 @@
 import { createContext, useCallback, useContext, useEffect, useMemo, useState } from 'react'
 import { authApi } from '../api/endpoints.js'
-import { getStoredToken, setStoredToken } from '../api/client.js'
+import { getStoredToken, onUnauthorized, setStoredToken } from '../api/client.js'
 
 const AuthContext = createContext(null)
 
@@ -9,7 +9,15 @@ export function AuthProvider({ children }) {
   const [loading, setLoading] = useState(Boolean(getStoredToken()))
 
   useEffect(() => {
-    if (!getStoredToken()) return
+    // Any 401 from anywhere in the app ends the session immediately.
+    onUnauthorized(() => setUser(null))
+  }, [])
+
+  useEffect(() => {
+    if (!getStoredToken()) {
+      setLoading(false)
+      return
+    }
     authApi
       .me()
       .then(setUser)
@@ -31,7 +39,14 @@ export function AuthProvider({ children }) {
     return data.user
   }, [])
 
-  const logout = useCallback(() => {
+  const logout = useCallback(async () => {
+    // Tell the server first (best effort), then always clear local state so a
+    // failed call can never leave the user appearing signed in.
+    try {
+      await authApi.logout()
+    } catch {
+      // The token is stateless; local cleanup below is what matters.
+    }
     setStoredToken(null)
     setUser(null)
   }, [])

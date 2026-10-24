@@ -7,7 +7,7 @@ from sqlalchemy.orm import Session
 
 from app.api.deps import get_current_user
 from app.database.connection import get_db
-from app.models import Migration, User
+from app.models import Migration, User, content_hash
 from app.schemas.migration import (
     DashboardStats,
     GenerateTestsRequest,
@@ -17,6 +17,7 @@ from app.schemas.migration import (
     MigrationSummary,
     MigrationUpdate,
     TestCaseOut,
+    VerificationResultOut,
 )
 from app.services.migration_service import MigrationService
 from app.services.test_generation_service import TestGenerationService
@@ -30,8 +31,31 @@ def _latest_result(migration: Migration):
     return sorted(migration.verification_results, key=lambda r: r.id)[-1]
 
 
+def _result_out(result, migration: Migration):
+    """Serialize a verification result, flagging whether it still describes the code."""
+    payload = VerificationResultOut.model_validate(result)
+    payload.stale = result.is_stale_for(
+        migration.source_code,
+        migration.migrated_code,
+        migration.source_language,
+        migration.target_language,
+    )
+    return payload
+
+
 def to_summary(migration: Migration) -> MigrationSummary:
     latest = _latest_result(migration)
+    latest_status = latest.overall_status if latest else None
+    latest_score = latest.behavior_match_percentage if latest else None
+    # A summary must never advertise a score that no longer matches the code.
+    if latest is not None and latest.is_stale_for(
+        migration.source_code,
+        migration.migrated_code,
+        migration.source_language,
+        migration.target_language,
+    ):
+        latest_status = None
+        latest_score = None
     return MigrationSummary(
         id=migration.id,
         title=migration.title,
@@ -40,8 +64,8 @@ def to_summary(migration: Migration) -> MigrationSummary:
         status=migration.status,
         created_at=migration.created_at,
         updated_at=migration.updated_at,
-        latest_behavior_match=latest.behavior_match_percentage if latest else None,
-        latest_overall_status=latest.overall_status if latest else None,
+        latest_behavior_match=latest_score,
+        latest_overall_status=latest_status,
     )
 
 
@@ -52,6 +76,16 @@ def to_detail(migration: Migration) -> MigrationDetail:
             detail.analysis = json.loads(migration.analysis_json)
         except json.JSONDecodeError:
             detail.analysis = None
+
+    current_source_hash = content_hash(migration.source_code)
+    for case in detail.test_cases:
+        case.stale = bool(case.source_code_hash) and case.source_code_hash != current_source_hash
+        if case.source_language and case.source_language != migration.source_language:
+            case.stale = True
+
+    detail.verification_results = [
+        _result_out(result, migration) for result in detail.verification_results
+    ]
     return detail
 
 

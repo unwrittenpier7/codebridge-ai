@@ -30,7 +30,13 @@ def get_db() -> Generator[Session, None, None]:
 
 
 def init_db() -> None:
-    """Create tables for all registered models."""
+    """Create tables for all registered models and apply additive column updates."""
     from app import models  # noqa: F401  (ensures models are imported/registered)
+    from app.database.migrations import reconcile_schema
 
     Base.metadata.create_all(bind=engine)
+    applied = reconcile_schema(engine)
+    if applied:
+        from app.core.logging_config import get_logger
+
+        get_logger(__name__).info("Applied %s additive schema change(s)", len(applied))

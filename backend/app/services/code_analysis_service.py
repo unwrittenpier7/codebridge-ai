@@ -24,6 +24,7 @@ TREE_SITTER_LANGUAGE_NAMES = {
     "javascript": "javascript",
     "java": "java",
     "cpp": "cpp",
+    "c": "c",
     "go": "go",
 }
 
@@ -88,7 +89,11 @@ class CodeAnalysisService:
             "imports": [],
             "control_flow": {},
             "reads_stdin": self._reads_stdin(code, language.key),
+            "semantic_signals": self._semantic_signals(code, language.key),
             "analyzer": "none",
+            # Static analysis never proves behavioral equivalence; it only lists
+            # constructs that deserve attention in the migration prompt.
+            "semantic_equivalence_proven": False,
         }
 
         if language.key == "python":
@@ -96,16 +101,24 @@ class CodeAnalysisService:
             if python_analysis is not None:
                 base.update(python_analysis)
                 base["analyzer"] = "python-ast"
+                base["analysis_confidence"] = "exact"
                 return base
 
         tree_sitter_analysis = self._analyze_with_tree_sitter(code, language.key)
         if tree_sitter_analysis is not None:
             base.update(tree_sitter_analysis)
             base["analyzer"] = "tree-sitter"
+            # Tree-sitter parses exactly, but an unparsed region downgrades this.
+            base["analysis_confidence"] = (
+                "approximate" if base.get("has_parse_errors") else "exact"
+            )
             return base
 
         base.update(self._analyze_with_regex(code, language.key))
         base["analyzer"] = "regex-fallback"
+        # Regex heuristics can miss or mis-attribute constructs; never present
+        # this as a proof of anything.
+        base["analysis_confidence"] = "heuristic"
         return base
 
     # -- python ------------------------------------------------------------
@@ -246,6 +259,7 @@ class CodeAnalysisService:
         patterns = {
             "java": r"(?:public|private|protected|static|\s)+[\w<>\[\]]+\s+(\w+)\s*\(([^)]*)\)\s*\{",
             "cpp": r"[\w:<>\*&\s]+\s+(\w+)\s*\(([^)]*)\)\s*\{",
+            "c": r"[\w\*&\s]+\s+(\w+)\s*\(([^)]*)\)\s*\{",
             "go": r"func\s+(\w+)\s*\(([^)]*)\)",
             "javascript": r"function\s+(\w+)\s*\(([^)]*)\)",
             "python": r"def\s+(\w+)\s*\(([^)]*)\)",
@@ -253,6 +267,7 @@ class CodeAnalysisService:
         class_patterns = {
             "java": r"class\s+(\w+)",
             "cpp": r"(?:class|struct)\s+(\w+)",
+            "c": r"(?:struct|union|enum)\s+(\w+)",
             "go": r"type\s+(\w+)\s+struct",
             "javascript": r"class\s+(\w+)",
             "python": r"class\s+(\w+)",
@@ -260,6 +275,7 @@ class CodeAnalysisService:
         import_patterns = {
             "java": r"import\s+([\w\.\*]+);",
             "cpp": r"#include\s*[<\"]([^>\"]+)[>\"]",
+            "c": r"#include\s*[<\"]([^>\"]+)[>\"]",
             "go": r'import\s+(?:\(([^)]*)\)|"([^"]+)")',
             "javascript": r'(?:import\s+.*?from\s+[\'"]([^\'"]+)[\'"]|require\([\'"]([^\'"]+)[\'"]\))',
             "python": r"^\s*(?:import|from)\s+([\w\.]+)",
@@ -294,12 +310,73 @@ class CodeAnalysisService:
         }
 
     # -- helpers ------------------------------------------------------------
+    def _semantic_signals(self, code: str, language_key: str) -> Dict[str, int]:
+        """Count language-specific constructs whose semantics differ across languages.
+
+        These counts are best-effort heuristics: they are meant to tell the
+        migration prompt which pitfalls are plausible, never to prove that the
+        migrated program behaves the same.
+        """
+        patterns = {
+            "c": {
+                "pointers": r"\b\w+\s*\*+\s*\w+|\*\s*\w+\s*=|->",
+                "memory": r"\b(malloc|calloc|realloc|free|memcpy|memset|strcpy|strdup)\b",
+                "arrays": r"\[\s*[^\]]*\]",
+                "integer_types": r"\b(int|long|short|unsigned|char|size_t|int8_t|int16_t|int32_t|int64_t)\b",
+                "uninitialized_risk": r"\b\w+\s+\w+\s*;",
+                "unsafe_strings": r"\b(strcpy|strcat|sprintf|gets)\b",
+            },
+            "cpp": {
+                "pointers": r"\b\w+\s*\*+\s*\w+|->|\bnew\b|\bdelete\b",
+                "memory": r"\b(new|delete|malloc|free|unique_ptr|shared_ptr)\b",
+                "arrays": r"\[\s*[^\]]*\]",
+                "integer_types": r"\b(int|long|short|unsigned|size_t|auto)\b",
+                "exceptions": r"\b(try|catch|throw)\b",
+            },
+            "java": {
+                "integer_types": r"\b(int|long|short|byte|char)\b",
+                "integer_overflow": r"\b(Integer\.(MAX_VALUE|MIN_VALUE)|Long\.(MAX_VALUE|MIN_VALUE))\b",
+                "null_handling": r"\bnull\b|Objects\.requireNonNull",
+                "exceptions": r"\b(try|catch|finally|throw|throws)\b",
+                "collections": r"\b(ArrayList|HashMap|HashSet|List|Map|Set)\b",
+                "strings": r"\b(String|StringBuilder|StringBuffer|charAt|substring)\b",
+            },
+            "python": {
+                "exceptions": r"\b(try|except|finally|raise)\b",
+                "collections": r"\b(list|dict|set|tuple|deque|defaultdict)\b",
+                "strings": r"\b(str|encode|decode|format|f\")\b",
+                "numeric": r"\b(int|float|round|Decimal)\b",
+                "null_handling": r"\bNone\b",
+            },
+            "javascript": {
+                "numeric": r"\b(parseInt|parseFloat|Number|Math\.)\b",
+                "null_handling": r"\b(null|undefined)\b",
+                "exceptions": r"\b(try|catch|finally|throw)\b",
+                "collections": r"\b(Array|Map|Set|Object)\b",
+                "strings": r"\.(slice|substring|replace|split|toUpperCase)\(",
+            },
+            "go": {
+                "pointers": r"\*|\&",
+                "errors": r"\berror\b|errors\.New|fmt\.Errorf",
+                "integer_types": r"\b(int|int32|int64|uint|byte|rune)\b",
+                "collections": r"\b(map|slice|\[\])\b",
+                "strings": r"\b(strings\.|fmt\.Sprintf)\b",
+                "concurrency": r"\b(go\s+\w+|chan\b|sync\.)\b",
+            },
+        }
+        return {
+            name: len(re.findall(pattern, code))
+            for name, pattern in patterns.get(language_key, {}).items()
+            if re.search(pattern, code)
+        }
+
     def _reads_stdin(self, code: str, language_key: str) -> bool:
         markers = {
             "python": ["input(", "sys.stdin", "readline"],
             "javascript": ["process.stdin", "readline", "require('fs').readFileSync(0"],
             "java": ["Scanner", "BufferedReader", "System.in"],
             "cpp": ["cin", "scanf", "getline", "fgets"],
+            "c": ["scanf", "fgets", "getchar", "getline"],
             "go": ["bufio.NewReader", "fmt.Scan", "os.Stdin"],
         }
         return any(marker in code for marker in markers.get(language_key, []))

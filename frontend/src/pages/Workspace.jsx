@@ -1,15 +1,18 @@
-import { useCallback, useEffect, useMemo, useState } from 'react'
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import { useNavigate, useParams } from 'react-router-dom'
 import Alert from '../components/Alert.jsx'
 import CorrectionHistory from '../components/CorrectionHistory.jsx'
 import EditorPanel from '../components/EditorPanel.jsx'
 import Spinner from '../components/Spinner.jsx'
+import StaleBanner from '../components/StaleBanner.jsx'
 import TestCaseList from '../components/TestCaseList.jsx'
 import TestResultTable from '../components/TestResultTable.jsx'
 import VerificationSummary from '../components/VerificationSummary.jsx'
 import { describeError } from '../api/client.js'
 import { migrationsApi, systemApi } from '../api/endpoints.js'
+import { useAsyncAction } from '../hooks/useAsyncAction.js'
 import { SAMPLES } from '../data/samples.js'
+import { describeStaleness, verificationSnapshot } from '../utils/staleness.js'
 
 const TABS = ['Test cases', 'Verification', 'Corrections']
 
@@ -28,17 +31,35 @@ export default function Workspace() {
   const [corrections, setCorrections] = useState([])
   const [migrationStatus, setMigrationStatus] = useState('draft')
   const [validation, setValidation] = useState(null)
-  const [busy, setBusy] = useState('')
-  const [error, setError] = useState('')
-  const [notice, setNotice] = useState('')
   const [tab, setTab] = useState(TABS[0])
+  //: Editor state that the currently displayed result was produced from.
+  const [verifiedSnapshot, setVerifiedSnapshot] = useState(null)
+  //: Hash of the source program the displayed test cases came from.
+  const [testsSourceFingerprint, setTestsSourceFingerprint] = useState(null)
+
+  const { busy, error, notice, run, setError, setNotice, isBusy } = useAsyncAction()
+  const cancelled = useRef(false)
+
+  useEffect(() => {
+    cancelled.current = false
+    return () => {
+      cancelled.current = true
+    }
+  }, [])
 
   const monacoFor = useCallback(
     (key) => languages.find((item) => item.key === key)?.monaco_id || key,
     [languages],
   )
   const extensionFor = useCallback((key) => {
-    const map = { python: 'py', javascript: 'js', java: 'java', cpp: 'cpp', go: 'go' }
+    const map = {
+      python: 'py',
+      javascript: 'js',
+      java: 'java',
+      cpp: 'cpp',
+      c: 'c',
+      go: 'go',
+    }
     return map[key] || 'txt'
   }, [])
 
@@ -56,7 +77,31 @@ export default function Workspace() {
     setCorrections(migration.correction_attempts || [])
     setMigrationStatus(migration.status)
     const results = migration.verification_results || []
-    setResult(results.length ? results[results.length - 1] : null)
+    const latest = results.length ? results[results.length - 1] : null
+    setResult(latest)
+    // The stored result knows the code it tested; treat that as the baseline so
+    // a reload does not immediately (and wrongly) show a stale banner.
+    setVerifiedSnapshot(
+      latest
+        ? verificationSnapshot({
+            sourceCode: migration.source_code || '',
+            migratedCode: migration.migrated_code || '',
+            sourceLanguage: migration.source_language,
+            targetLanguage: migration.target_language,
+          })
+        : null,
+    )
+    const cases = migration.test_cases || []
+    setTestsSourceFingerprint(
+      cases.length
+        ? verificationSnapshot({
+            sourceCode: migration.source_code || '',
+            migratedCode: '',
+            sourceLanguage: migration.source_language,
+            targetLanguage: migration.target_language,
+          }).sourceCode
+        : null,
+    )
   }, [])
 
   useEffect(() => {
@@ -65,7 +110,23 @@ export default function Workspace() {
       .get(routeMigrationId)
       .then(applyMigration)
       .catch((err) => setError(describeError(err)))
-  }, [routeMigrationId, applyMigration])
+  }, [routeMigrationId, applyMigration, setError])
+
+  const currentSnapshot = useMemo(
+    () => verificationSnapshot({ sourceCode, migratedCode, sourceLanguage, targetLanguage }),
+    [sourceCode, migratedCode, sourceLanguage, targetLanguage],
+  )
+
+  const resultStaleness = useMemo(
+    () => describeStaleness(currentSnapshot, verifiedSnapshot),
+    [currentSnapshot, verifiedSnapshot],
+  )
+  const testsAreStale = useMemo(
+    () =>
+      Boolean(testsSourceFingerprint) &&
+      testsSourceFingerprint !== currentSnapshot.sourceCode,
+    [testsSourceFingerprint, currentSnapshot.sourceCode],
+  )
 
   const ensureMigration = useCallback(async () => {
     if (migrationId) {
@@ -87,22 +148,6 @@ export default function Workspace() {
     return created.id
   }, [migrationId, navigate, sourceCode, sourceLanguage, targetLanguage])
 
-  const run = useCallback(
-    async (label, action) => {
-      setBusy(label)
-      setError('')
-      setNotice('')
-      try {
-        await action()
-      } catch (err) {
-        setError(describeError(err))
-      } finally {
-        setBusy('')
-      }
-    },
-    [],
-  )
-
   const handleMigrate = () =>
     run('Migrating', async () => {
       const id = await ensureMigration()
@@ -111,8 +156,10 @@ export default function Workspace() {
         source_language: sourceLanguage,
         target_language: targetLanguage,
       })
+      if (cancelled.current) return
       applyMigration(migration)
       setValidation(null)
+      setVerifiedSnapshot(null)
       setNotice('Migration completed. Generate tests to verify behavior.')
     })
 
@@ -120,6 +167,7 @@ export default function Workspace() {
     run('Validating', async () => {
       const id = await ensureMigration()
       const response = await migrationsApi.validate(id, { migrated_code: migratedCode })
+      if (cancelled.current) return
       setValidation(response)
     })
 
@@ -127,16 +175,22 @@ export default function Workspace() {
     run('Generating tests', async () => {
       const id = await ensureMigration()
       const cases = await migrationsApi.generateTests(id, {})
+      if (cancelled.current) return
       setTestCases(cases)
+      setTestsSourceFingerprint(currentSnapshot.sourceCode)
       setTab('Test cases')
-      setNotice(`${cases.length} test cases generated; reference outputs came from your original program.`)
+      setNotice(
+        `${cases.length} test cases generated; reference outputs came from your original program.`,
+      )
     })
 
   const handleVerify = () =>
     run('Verifying', async () => {
       const id = await ensureMigration()
       const response = await migrationsApi.verify(id, { migrated_code: migratedCode })
+      if (cancelled.current) return
       setResult(response.result)
+      setVerifiedSnapshot(currentSnapshot)
       setMigrationStatus(response.migration_status)
       setTab('Verification')
     })
@@ -145,6 +199,7 @@ export default function Workspace() {
     run('Fixing with AI', async () => {
       const id = await ensureMigration()
       const response = await migrationsApi.fix(id, {})
+      if (cancelled.current) return
       setMigratedCode(response.migrated_code || '')
       setCorrections((current) => [...current, ...response.corrections])
       setResult(response.final_result)
@@ -167,6 +222,8 @@ export default function Workspace() {
     setCorrections([])
     setValidation(null)
     setMigrationStatus('draft')
+    setVerifiedSnapshot(null)
+    setTestsSourceFingerprint(null)
   }
 
   const canVerify = useMemo(
@@ -200,19 +257,30 @@ export default function Workspace() {
               </option>
             ))}
           </select>
-          <button type="button" className="btn btn-primary" onClick={handleMigrate} disabled={Boolean(busy)}>
+          <button type="button" className="btn btn-primary" onClick={handleMigrate} disabled={isBusy}>
             Migrate
           </button>
-          <button type="button" className="btn" onClick={handleValidate} disabled={Boolean(busy) || !migratedCode}>
+          <button
+            type="button"
+            className="btn"
+            onClick={handleValidate}
+            disabled={isBusy || !migratedCode}
+          >
             Validate
           </button>
-          <button type="button" className="btn" onClick={handleGenerateTests} disabled={Boolean(busy)}>
+          <button type="button" className="btn" onClick={handleGenerateTests} disabled={isBusy}>
             Generate tests
           </button>
-          <button type="button" className="btn" onClick={handleVerify} disabled={Boolean(busy) || !canVerify}>
+          <button
+            type="button"
+            className="btn"
+            onClick={handleVerify}
+            disabled={isBusy || !canVerify}
+            title={canVerify ? undefined : 'Generate tests and migrate first'}
+          >
             Run verification
           </button>
-          <button type="button" className="btn" onClick={handleFix} disabled={Boolean(busy) || !canFix}>
+          <button type="button" className="btn" onClick={handleFix} disabled={isBusy || !canFix}>
             Fix with AI
           </button>
         </div>
@@ -226,9 +294,28 @@ export default function Workspace() {
       ) : null}
       {notice ? <Alert variant="info">{notice}</Alert> : null}
       {validation ? (
-        <Alert variant={validation.compilation_status === 'PASS' ? 'success' : 'error'} title={`Compilation ${validation.compilation_status}`}>
+        <Alert
+          variant={validation.compilation_status === 'PASS' ? 'success' : 'error'}
+          title={`Compilation ${validation.compilation_status}`}
+        >
           {validation.error}
         </Alert>
+      ) : null}
+      {result && resultStaleness.stale ? (
+        <StaleBanner
+          kind="verification"
+          reasons={resultStaleness.reasons}
+          actionLabel="Re-run verification"
+          onAction={canVerify && !isBusy ? handleVerify : undefined}
+        />
+      ) : null}
+      {testsAreStale ? (
+        <StaleBanner
+          kind="tests"
+          reasons={['the source code changed']}
+          actionLabel="Regenerate tests"
+          onAction={!isBusy ? handleGenerateTests : undefined}
+        />
       ) : null}
 
       <div className="grid min-h-[420px] flex-1 gap-4 lg:grid-cols-2">
@@ -269,7 +356,9 @@ export default function Workspace() {
             </button>
           ))}
         </nav>
-        {tab === 'Test cases' ? <TestCaseList testCases={testCases} /> : null}
+        {tab === 'Test cases' ? (
+          <TestCaseList testCases={testCases} stale={testsAreStale} />
+        ) : null}
         {tab === 'Verification' ? (
           result ? (
             <div className="space-y-4">
@@ -278,6 +367,7 @@ export default function Workspace() {
                 sourceLanguage={sourceLanguage}
                 targetLanguage={targetLanguage}
                 migrationStatus={migrationStatus}
+                stale={resultStaleness.stale}
               />
               <TestResultTable results={result.test_results} />
             </div>

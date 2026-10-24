@@ -19,6 +19,7 @@ export default {
         pass: '#3fb950',
         fail: '#f85149',
         partial: '#d29922',
+        warn: '#d29922',
       },
       fontFamily: {
         mono: ['JetBrains Mono', 'Fira Code', 'ui-monospace', 'SFMono-Regular', 'monospace'],

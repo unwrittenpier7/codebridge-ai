@@ -108,4 +108,37 @@ def main():
 main()
 `,
   },
+  {
+    id: 'c-to-python-gcd',
+    name: 'GCD + array sum (C → Python)',
+    sourceLanguage: 'c',
+    targetLanguage: 'python',
+    code: `#include <stdio.h>
+
+int gcd(int a, int b) {
+    while (b != 0) {
+        int temp = b;
+        b = a % b;
+        a = temp;
+    }
+    return a;
+}
+
+int main(void) {
+    int n;
+    if (scanf("%d", &n) != 1) {
+        return 0;
+    }
+    int values[64];
+    int total = 0;
+    for (int i = 0; i < n; ++i) {
+        scanf("%d", &values[i]);
+        total += values[i];
+    }
+    printf("%d\\n", gcd(values[0], values[1]));
+    printf("%d\\n", total);
+    return 0;
+}
+`,
+  },
 ]

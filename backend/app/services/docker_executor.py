@@ -8,8 +8,16 @@ every program run happens inside a throwaway container with:
 * a PID limit
 * a wall-clock timeout
 * a temporary working directory mounted read/write for that run only
-* a non-root user
 * automatic container removal
+
+Container user
+--------------
+The executor drops privileges to a non-root uid/gid so a compromised program
+cannot write outside its own bind mount. `os.getuid`/`os.getgid` do **not** exist
+on Windows Python, so they are looked up through `getattr` with a fallback to the
+well-known unprivileged `1000:1000`. `DOCKER_CONTAINER_USER` can override the
+value (e.g. `0:0` on a host where the bind-mounted temp directory is not
+world-writable, or a specific uid on a rootless daemon).
 """
 from __future__ import annotations
 
@@ -45,6 +53,32 @@ except Exception:  # pragma: no cover
 
 
 JAVA_PUBLIC_CLASS = re.compile(r"public\s+(?:final\s+|abstract\s+)?class\s+([A-Za-z_]\w*)")
+
+#: Exit code used when a program had to be killed for exceeding its time limit.
+TIMEOUT_EXIT_CODE = 124
+
+#: Fallback uid:gid when the host has no POSIX user ids (Windows).
+FALLBACK_CONTAINER_USER = "1000:1000"
+
+
+def container_user() -> str:
+    """Return the `uid:gid` the sandbox should run as, portably.
+
+    Windows CPython has no `os.getuid`/`os.getgid`; falling back to a fixed
+    unprivileged pair keeps the privilege drop on Linux while remaining
+    importable and runnable on Windows.
+    """
+    configured = (settings.docker_container_user or "").strip()
+    if configured:
+        return configured
+    getuid = getattr(os, "getuid", None)
+    getgid = getattr(os, "getgid", None)
+    if callable(getuid) and callable(getgid):
+        try:
+            return f"{getuid()}:{getgid()}"
+        except Exception:  # pragma: no cover - defensive
+            pass
+    return FALLBACK_CONTAINER_USER
 
 
 @dataclass
@@ -102,7 +136,13 @@ def _truncate(text: str) -> str:
 
 
 def _shell_quote(parts: List[str]) -> str:
-    return " ".join(f"'{p}'" if " " in p else p for p in parts)
+    """Quote a command for `/bin/sh -c`.
+
+    Every element is single-quoted (with embedded quotes escaped) rather than
+    only quoting arguments that contain a space, so a hostile filename or flag
+    cannot break out of the command line.
+    """
+    return " ".join("'" + part.replace("'", "'\\''") + "'" for part in parts)
 
 
 class DockerExecutor:
@@ -162,6 +202,9 @@ class DockerExecutor:
         self.ensure_image(language.image)
 
         workdir = tempfile.mkdtemp(prefix="codebridge-")
+        # The container runs as an unprivileged uid, so the bind mount has to be
+        # writable by it (build artifacts, Go caches). 0o777 on a private temp
+        # directory is the standard trade-off; the directory is removed after use.
         os.chmod(workdir, 0o777)
 
         source_filename = language.source_filename
@@ -175,8 +218,10 @@ class DockerExecutor:
             compile_command = ["javac", source_filename]
             run_command = ["java", class_name]
 
-        with open(os.path.join(workdir, source_filename), "w", encoding="utf-8") as handle:
+        source_path = os.path.join(workdir, source_filename)
+        with open(source_path, "w", encoding="utf-8") as handle:
             handle.write(code)
+        os.chmod(source_path, 0o644)
 
         program = PreparedProgram(language=language, workdir=workdir, run_command=run_command)
 
@@ -219,6 +264,7 @@ class DockerExecutor:
         input_path = os.path.join(program.workdir, "__stdin.txt")
         with open(input_path, "w", encoding="utf-8") as handle:
             handle.write(stdin_data or "")
+        os.chmod(input_path, 0o644)
 
         command = f"{_shell_quote(program.run_command)} < __stdin.txt"
         return self._run_in_container(
@@ -238,6 +284,27 @@ class DockerExecutor:
             return program.compilation, self.run(program, stdin_data)
         finally:
             program.cleanup()
+
+    def run_shell(
+        self,
+        image: str,
+        workdir: str,
+        shell_command: str,
+        timeout: Optional[int] = None,
+        env: Optional[dict] = None,
+    ) -> ExecutionResult:
+        """Run an arbitrary shell command in the sandbox against a workspace.
+
+        Public wrapper around the internal runner, used for syntax-only checks
+        (`python -m py_compile`, `node --check`) that are not a full program run.
+        """
+        return self._run_in_container(
+            image=image,
+            workdir=workdir,
+            shell_command=shell_command,
+            timeout=timeout or settings.max_execution_time,
+            env=env,
+        )
 
     # -- internals ---------------------------------------------------------
     def _language_env(self, language: LanguageConfig) -> dict:
@@ -282,7 +349,7 @@ class DockerExecutor:
                 memswap_limit=f"{settings.max_memory_mb}m",
                 nano_cpus=1_000_000_000,  # 1 CPU
                 pids_limit=settings.max_processes,
-                user=f"{os.getuid()}:{os.getgid()}",
+                user=container_user(),
                 environment=env or {},
                 stdin_open=False,
                 tty=False,
@@ -298,7 +365,7 @@ class DockerExecutor:
                 exit_code = int(status.get("StatusCode", 0))
             except Exception:
                 timed_out = True
-                exit_code = 124
+                exit_code = TIMEOUT_EXIT_CODE
                 try:
                     container.kill()
                 except Exception:  # pragma: no cover - best effort
@@ -308,9 +375,7 @@ class DockerExecutor:
             stdout = container.logs(stdout=True, stderr=False).decode("utf-8", "replace")
             stderr = container.logs(stdout=False, stderr=True).decode("utf-8", "replace")
             if timed_out:
-                stderr = (
-                    stderr + f"\nExecution timed out after {timeout}s."
-                ).strip()
+                stderr = (stderr + f"\nExecution timed out after {timeout}s.").strip()
             return ExecutionResult(
                 stdout=_truncate(stdout),
                 stderr=_truncate(stderr),

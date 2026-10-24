@@ -1,4 +1,13 @@
-"""Migration business logic: CRUD plus the analyze -> migrate step."""
+"""Migration business logic: CRUD plus the analyze -> migrate step.
+
+Invalidation contract
+---------------------
+A stored verification result or test case only describes the exact code version
+it was produced from. `update` therefore records the code hashes of the previous
+version and marks dependent artifacts stale instead of deleting them: history is
+preserved (and clearly labelled) while the API can never present a stale PASS as
+if it applied to the edited code.
+"""
 from __future__ import annotations
 
 import json
@@ -11,7 +20,7 @@ from app.core.errors import NotFoundError, ValidationError
 from app.core.config import settings
 from app.core.languages import get_language
 from app.core.logging_config import get_logger
-from app.models import Migration, MigrationStatus, User
+from app.models import Migration, MigrationStatus, User, content_hash
 from app.schemas.migration import MigrationCreate, MigrationUpdate
 from app.services.ai_service import AIService, get_ai_service
 from app.services.code_analysis_service import code_analysis_service
@@ -72,26 +81,59 @@ class MigrationService:
         )
         migration = self.db.scalars(stmt).unique().one_or_none()
         if migration is None:
+            # A resource owned by somebody else is indistinguishable from a
+            # missing one, so ownership is never leaked through 403 vs 404.
             raise NotFoundError(f"Migration {migration_id} was not found.")
         return migration
 
     def update(self, user: User, migration_id: int, payload: MigrationUpdate) -> Migration:
         migration = self.get_for_user(user, migration_id)
+
+        code_changed = False
         if payload.title is not None:
             migration.title = payload.title
-        if payload.source_code is not None:
+        if payload.source_code is not None and payload.source_code != migration.source_code:
             self._validate_code_size(payload.source_code)
             migration.source_code = payload.source_code
-        if payload.migrated_code is not None:
+            code_changed = True
+        if payload.migrated_code is not None and payload.migrated_code != migration.migrated_code:
             self._validate_code_size(payload.migrated_code)
             migration.migrated_code = payload.migrated_code
+            code_changed = True
         if payload.source_language is not None:
-            migration.source_language = get_language(payload.source_language).key
+            new_source = get_language(payload.source_language).key
+            if new_source != migration.source_language:
+                migration.source_language = new_source
+                code_changed = True
         if payload.target_language is not None:
-            migration.target_language = get_language(payload.target_language).key
+            new_target = get_language(payload.target_language).key
+            if new_target != migration.target_language:
+                migration.target_language = new_target
+                code_changed = True
+
+        if code_changed:
+            # Results are kept for history, but the API marks them stale because
+            # their recorded hashes no longer match the stored code.
+            self._invalidate_downstream(migration)
+
         self.db.commit()
         self.db.refresh(migration)
         return migration
+
+    def _invalidate_downstream(self, migration: Migration) -> None:
+        """Return a migration to a stable status after its code changed.
+
+        Stored results and test cases are deliberately *kept*: they are history,
+        and the API derives a `stale` flag from their recorded hashes. Only a
+        non-terminal status is reset, so the record cannot be left claiming it is
+        "verifying" code that no longer exists.
+        """
+        if migration.status in {
+            MigrationStatus.VERIFYING.value,
+            MigrationStatus.MIGRATING.value,
+        }:
+            migration.status = MigrationStatus.DRAFT.value
+        logger.info("Code changed for migration %s; prior results are now stale", migration.id)
 
     def delete(self, user: User, migration_id: int) -> None:
         migration = self.get_for_user(user, migration_id)
@@ -131,6 +173,7 @@ class MigrationService:
                 analysis=analysis,
             )
         except Exception:
+            self.db.rollback()
             migration.status = MigrationStatus.ERROR.value
             self.db.commit()
             raise
@@ -149,8 +192,7 @@ class MigrationService:
     def _validate_code_size(self, code: Optional[str]) -> None:
         if code is None:
             return
-        max_bytes = settings.max_code_size_kb * 1024
-        if len(code.encode("utf-8")) > max_bytes:
+        if len(code.encode("utf-8")) > settings.max_code_size_bytes:
             raise ValidationError(
                 f"Source code exceeds the maximum size of {settings.max_code_size_kb} KB."
             )

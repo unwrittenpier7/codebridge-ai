@@ -24,14 +24,20 @@ behaviorally equivalent. Compilation success is never treated as correctness.
 - [Example migration](#example-migration)
 - [Verification workflow](#verification-workflow)
 - [Testing](#testing)
+- [Known limitations](#known-limitations)
 - [Security considerations](#security-considerations)
 
 ---
 
 ## Features
 
-- **Real AI migration** between Python, Java, C++, JavaScript and Go (OpenAI or Gemini,
+- **Real AI migration** between Python, Java, C++, C, JavaScript and Go (OpenAI or Gemini,
   selected with `AI_PROVIDER`). No mocked or canned migration output anywhere in the system.
+  C is a first-class language, compiled with `gcc -std=c11`; it is never treated as C++.
+- **Structured AI output handling**: requests that must return JSON use the provider's JSON
+  response mode where the SDK and model support it, and every answer is validated against an
+  explicit schema (wrapper unwrapping, Markdown-fence stripping, single-payload enforcement,
+  required-field and type checks) with at most one controlled retry.
 - **Static analysis** of the source program (functions, classes, variables, imports,
   control flow, signatures, stdin usage) via Python `ast` and Tree-sitter, fed to the model
   as migration context.
@@ -40,8 +46,18 @@ behaviorally equivalent. Compilation success is never treated as correctness.
   they are produced by executing the original program.
 - **Sandboxed execution** of every program in a throwaway Docker container with CPU, memory,
   PID, output-size and wall-clock limits, no network, dropped capabilities and automatic cleanup.
-- **Behavioral comparison** of actual stdout, tolerant of line-ending and trailing-whitespace
-  noise and float formatting, strict about anything that changes observable behavior.
+  The container user is resolved portably: the current `uid:gid` on POSIX, `1000:1000` on
+  Windows (where `os.getuid`/`os.getgid` do not exist).
+- **Behavioral comparison** of actual stdout. Whitespace normalization is a documented,
+  explicit policy (line-ending and trailing-whitespace noise only); meaningful string and
+  numeric differences are preserved, and numeric tolerance is **off by default**.
+- **Reference-validity tracking**: if the original program fails to compile or run, the test
+  is recorded as having no valid reference and is never counted as a behavioral match — two
+  programs failing the same way is not equivalence.
+- **Stale-result protection**: every verification run and every generated test case stores a
+  hash of the exact code it was produced from. Changing the source code, migrated code or
+  either language marks those artifacts stale (server-side) and shows a warning with a
+  re-run action (client-side, including for unsaved edits) instead of presenting an old PASS.
 - **Bounded AI correction loop** (max 3 attempts, configurable): failed tests, both programs'
   outputs and compiler/runtime errors are sent back to the model, the corrected program is
   re-verified, and every attempt is stored with before/after match percentages.
@@ -197,14 +213,19 @@ npm run dev        # http://localhost:5173, proxies /api to localhost:8000
 Two independent uses of Docker:
 
 1. **Code execution (required).** The backend pulls and runs these images on demand:
-   `python:3.11-alpine`, `node:20-alpine`, `eclipse-temurin:21-jdk-alpine`, `gcc:13`,
-   `golang:1.22-alpine`. Pre-pull them for a faster first run:
+   `python:3.11-alpine`, `node:20-alpine`, `eclipse-temurin:21-jdk-alpine`, `gcc:13`
+   (used for **both** C and C++), `golang:1.22-alpine`. Pre-pull them for a faster first run:
 
    ```bash
    docker pull python:3.11-alpine && docker pull node:20-alpine \
      && docker pull eclipse-temurin:21-jdk-alpine && docker pull gcc:13 \
      && docker pull golang:1.22-alpine
    ```
+
+   On Windows, install **Docker Desktop** and leave it running (the WSL 2 backend is
+   recommended). `DOCKER_HOST` is read from the environment when set. The sandbox user falls
+   back to `1000:1000` because Windows Python has no `os.getuid`/`os.getgid`; override it with
+   `DOCKER_CONTAINER_USER` if your bind mounts need a different owner.
 
 2. **Running the app itself (optional).**
 
@@ -323,17 +344,35 @@ Overall: `PASS`, behavioral match 100%.
 # Backend: unit tests only (no Docker required)
 cd backend && .venv/bin/python -m pytest -m "not docker"
 
-# Backend: full suite, including real container execution in all five languages
+# Backend: full suite, including real container execution in all six languages
 .venv/bin/python -m pytest
 
 # Frontend
 cd frontend && npm run lint && npm run test && npm run build
 ```
 
+Docker-marked tests are skipped explicitly (with the daemon's availability message) when no
+Docker daemon is reachable, so a Docker-less run is visibly incomplete rather than green.
+
 The Docker-marked tests assert real behavior: each language compiles and runs, runtime
 errors surface exit codes and stderr, infinite loops time out, the sandbox has no network,
 oversized sources are rejected, output is truncated, a behaviorally-wrong-but-compiling
 program is reported as not equivalent, and the correction loop respects its maximum.
+
+## Known limitations
+
+- **Static analysis is best-effort.** Python uses the real `ast` module (exact). Other
+  languages use Tree-sitter, and fall back to regular expressions when it is unavailable.
+  The response carries `analyzer` and `analysis_confidence`, and
+  `semantic_equivalence_proven` is always `false`: no static analysis in this project claims
+  to prove equivalence. Only executing both programs does that.
+- **Aliases are conservative.** `cc` is deliberately *not* mapped to C or C++ because it is
+  ambiguous (the C compiler to `make(1)`, a C++ extension to compilers). Use `c` or `cpp`.
+- **Verification is behavioral, not formal.** Two programs that agree on every generated
+  input may still differ on inputs the model did not propose.
+- **Numeric tolerance is off by default** and must be enabled explicitly per deployment.
+- **Docker is required for verification.** Without it, migration and test generation still
+  work, but verification reports an infrastructure error rather than a result.
 
 ## Security considerations
 
@@ -345,6 +384,11 @@ program is reported as not equivalent, and the correction loop respects its maxi
 - The Docker socket is reachable by the backend only; it is never exposed to the frontend.
 - Passwords are bcrypt-hashed; API access uses signed, expiring JWTs; every migration query
   is scoped to the authenticated user.
+- Production startup refuses placeholder or short `JWT_SECRET` values, requires an explicit
+  `CORS_ORIGINS` allow-list, and rejects unknown JWT algorithms.
+- Authentication endpoints are rate-limited per client IP; request bodies and source-code
+  inputs are size-bounded; unexpected exceptions are returned as a generic message with an
+  error type, never a traceback or internal detail.
 - API keys are read from environment variables only, and `.env` is git-ignored.
 - Compilation success is explicitly *not* treated as behavioral equivalence, and AI-claimed
   expected outputs are never trusted — only real execution of the original program is.

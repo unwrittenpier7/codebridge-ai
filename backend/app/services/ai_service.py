@@ -1,23 +1,36 @@
 """AI-facing operations: migration, test generation, error analysis and correction.
 
-This module owns prompt construction and response parsing only; the transport is
-delegated to an `LLMProvider`.
+This module owns prompt construction, response parsing and the *single* bounded
+retry allowed for a recoverable malformed answer. The transport is delegated to
+an `LLMProvider`.
+
+Two completion flavours are kept strictly apart:
+
+* source-code generation (`migrate_code`, `correct_code`) uses free-form text;
+* structured generation (`generate_test_cases`) uses the provider's JSON mode and
+  the schema validation in `app.services.test_case_schema`.
 """
 from __future__ import annotations
 
 import json
-import re
 from typing import Any, Dict, List, Optional
 
-from app.core.config import settings
-from app.core.errors import AIProviderError
+from app.core.errors import (
+    AIProviderError,
+    AITestSchemaError,
+    AITruncatedResponseError,
+    ValidationError,
+)
 from app.core.languages import get_language
 from app.core.logging_config import get_logger
-from app.services.ai_providers import LLMProvider, get_provider
+from app.services.ai_json import extract_json, find_notes_section, strip_code_fence
+from app.services.ai_providers import Completion, LLMProvider, get_provider
+from app.services.test_case_schema import normalize_test_cases
 
 logger = get_logger(__name__)
 
-CODE_FENCE = re.compile(r"```[a-zA-Z0-9+#]*\s*\n(.*?)```", re.DOTALL)
+#: One retry only: a second malformed answer means the model is not usable here.
+MAX_JSON_ATTEMPTS = 2
 
 MIGRATION_SYSTEM_PROMPT = (
     "You are an expert compiler engineer performing source-to-source code migration. "
@@ -30,7 +43,14 @@ MIGRATION_SYSTEM_PROMPT = (
 TEST_SYSTEM_PROMPT = (
     "You are a test engineer. You design stdin payloads that exercise a program thoroughly: "
     "normal cases, boundary values, zero, negatives, empty input where applicable, large values "
-    "and edge cases. You never invent expected outputs that you cannot justify from the code."
+    "and edge cases. You never invent expected outputs that you cannot justify from the code. "
+    "You answer with JSON only, exactly in the requested schema."
+)
+
+TEST_RETRY_SYSTEM_PROMPT = (
+    TEST_SYSTEM_PROMPT
+    + " The previous answer could not be parsed. Return ONLY the JSON array, with no "
+    "explanation, no Markdown fence and no commentary."
 )
 
 FIX_SYSTEM_PROMPT = (
@@ -42,34 +62,7 @@ FIX_SYSTEM_PROMPT = (
 
 def extract_code(text: str) -> str:
     """Pull a code block out of an LLM response, tolerating prose around it."""
-    matches = CODE_FENCE.findall(text or "")
-    if matches:
-        return max(matches, key=len).strip()
-    return (text or "").strip()
-
-
-def extract_json(text: str) -> Any:
-    """Pull the first JSON object/array out of an LLM response."""
-    candidate = (text or "").strip()
-    fenced = CODE_FENCE.findall(candidate)
-    for block in fenced:
-        try:
-            return json.loads(block)
-        except json.JSONDecodeError:
-            continue
-    try:
-        return json.loads(candidate)
-    except json.JSONDecodeError:
-        pass
-    for opener, closer in (("[", "]"), ("{", "}")):
-        start = candidate.find(opener)
-        end = candidate.rfind(closer)
-        if start != -1 and end > start:
-            try:
-                return json.loads(candidate[start : end + 1])
-            except json.JSONDecodeError:
-                continue
-    raise AIProviderError("The AI response did not contain valid JSON.")
+    return strip_code_fence(text)
 
 
 class AIService:
@@ -99,8 +92,8 @@ class AIService:
         analysis_block = ""
         if analysis:
             analysis_block = (
-                "\nStatic analysis of the source program (for context):\n"
-                + json.dumps(analysis, indent=2)[:4000]
+                "\nStatic analysis of the source program (best-effort context, not a proof of "
+                "equivalence):\n" + json.dumps(analysis, indent=2)[:4000]
             )
 
         prompt = f"""Migrate the following {source.label} program to {target.label}.
@@ -110,8 +103,7 @@ Requirements:
 - The program must be runnable as a standalone file ({target.source_filename}).
 - Read input from stdin when the original does; do not print extra prompts.
 - Use only the {target.label} standard library.
-{"- The Java entry class must be named Main." if target.key == "java" else ""}
-{"- Go code must be package main with a func main()." if target.key == "go" else ""}
+{target.migration_guidance}
 {analysis_block}
 
 Source ({source.label}):
@@ -126,10 +118,7 @@ Respond with the migrated {target.label} program in a single fenced code block, 
         code = extract_code(raw)
         if not code:
             raise AIProviderError("The AI did not return any migrated code.")
-        notes = ""
-        if "### Notes" in raw:
-            notes = raw.split("### Notes", 1)[1].strip()
-        return {"code": code, "explanation": notes}
+        return {"code": code, "explanation": find_notes_section(raw, "Notes")}
 
     # -- test generation --------------------------------------------------
     def generate_test_cases(
@@ -139,9 +128,19 @@ Respond with the migrated {target.label} program in a single fenced code block, 
         count: int = 8,
         analysis: Optional[Dict[str, Any]] = None,
     ) -> List[Dict[str, str]]:
+        """Ask the model for stdin payloads and return validated, normalized cases.
+
+        Exactly one retry is attempted when the first answer is unusable *and*
+        the failure is recoverable (malformed JSON, wrong shape, truncation,
+        empty answer). Refusals, rate limits and invalid requests are never
+        retried because a second identical request cannot succeed.
+        """
         source = get_language(source_language)
         analysis_block = (
-            "\nStatic analysis:\n" + json.dumps(analysis, indent=2)[:3000] if analysis else ""
+            "\nStatic analysis (best-effort context):\n"
+            + json.dumps(analysis, indent=2)[:3000]
+            if analysis
+            else ""
         )
         prompt = f"""Design up to {count} test cases for the following {source.label} program.
 
@@ -163,31 +162,47 @@ Respond with ONLY a JSON array, no prose, using this shape:
 Use "\\n" escapes for newlines inside the input string. category must be one of:
 normal, boundary, zero, negative, empty, large, edge."""
 
-        raw = self.provider.complete(TEST_SYSTEM_PROMPT, prompt, temperature=0.4)
-        data = extract_json(raw)
-        if isinstance(data, dict):
-            data = data.get("test_cases") or data.get("tests") or []
-        if not isinstance(data, list):
-            raise AIProviderError("The AI did not return a list of test cases.")
+        last_error: Optional[Exception] = None
+        for attempt in range(MAX_JSON_ATTEMPTS):
+            system_prompt = TEST_SYSTEM_PROMPT if attempt == 0 else TEST_RETRY_SYSTEM_PROMPT
+            try:
+                completion = self.provider.complete_json(
+                    system_prompt, prompt, temperature=0.4
+                )
+                return self._parse_test_cases(completion, count)
+            except AIProviderError as exc:
+                # Only failures that a stricter second request could plausibly fix
+                # are retried: unusable/malformed/empty/truncated answers. A
+                # refusal, a rate limit or an invalid request is deterministic, so
+                # retrying it would just burn another API call.
+                last_error = exc
+                if not getattr(exc, "retryable", False) or attempt == MAX_JSON_ATTEMPTS - 1:
+                    raise
+                logger.warning(
+                    "Test generation attempt %s/%s failed (%s); retrying once.",
+                    attempt + 1,
+                    MAX_JSON_ATTEMPTS,
+                    type(exc).__name__,
+                )
 
-        cases: List[Dict[str, str]] = []
-        for item in data[:count]:
-            if not isinstance(item, dict):
-                continue
-            raw_input = item.get("input", "")
-            if isinstance(raw_input, (list, tuple)):
-                raw_input = "\n".join(str(part) for part in raw_input)
-            cases.append(
-                {
-                    "input": str(raw_input),
-                    "expected_behavior": str(item.get("expected_behavior", "")).strip(),
-                    "description": str(item.get("description", "")).strip() or "AI generated case",
-                    "category": str(item.get("category", "normal")).strip().lower(),
-                }
-            )
-        if not cases:
-            raise AIProviderError("The AI returned an empty test-case list.")
-        return cases
+        assert last_error is not None
+        raise last_error
+
+    @staticmethod
+    def _parse_test_cases(completion: Completion, count: int) -> List[Dict[str, str]]:
+        raw = completion.text
+        try:
+            data = extract_json(raw)
+        except AIProviderError as exc:
+            if completion.truncated:
+                # Distinguish "the model ran out of room" from "the model wrote
+                # something unparseable", because the fix is different.
+                raise AITruncatedResponseError(
+                    "The AI response was cut off at the model's output limit, so the "
+                    "test-case list is incomplete. Try requesting fewer test cases."
+                ) from exc
+            raise
+        return normalize_test_cases(data, count)
 
     # -- error analysis / correction --------------------------------------
     def analyze_failure(self, report: Dict[str, Any]) -> str:
@@ -227,7 +242,7 @@ Verification evidence (produced by actually executing both programs in a sandbox
 
 Fix the {target.label} program so that, for every listed input, its stdout matches the original's
 stdout exactly. Keep the same stdin parsing contract.
-{"The Java entry class must be named Main." if target.key == "java" else ""}
+{target.migration_guidance}
 
 Respond with the corrected {target.label} program in a single fenced code block, followed by a
 "### Reason" section of at most three sentences describing the root cause you fixed."""
@@ -236,9 +251,7 @@ Respond with the corrected {target.label} program in a single fenced code block,
         code = extract_code(raw)
         if not code:
             raise AIProviderError("The AI did not return corrected code.")
-        reason = ""
-        if "### Reason" in raw:
-            reason = raw.split("### Reason", 1)[1].strip()
+        reason = find_notes_section(raw, "Reason")
         return {"code": code, "reason": reason or "AI correction attempt."}
 
 

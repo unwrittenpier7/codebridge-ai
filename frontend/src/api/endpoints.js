@@ -4,6 +4,7 @@ export const authApi = {
   register: (payload) => apiClient.post('/api/auth/register', payload).then((r) => r.data),
   login: (payload) => apiClient.post('/api/auth/login', payload).then((r) => r.data),
   me: () => apiClient.get('/api/auth/me').then((r) => r.data),
+  logout: () => apiClient.post('/api/auth/logout').then((r) => r.data),
 }
 
 export const systemApi = {
